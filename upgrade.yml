@@ -1,0 +1,121 @@
+- name: Upgrade Ubuntu
+  hosts: ubuntu_servers
+  become: yes
+
+  tasks:
+    - name: Create backup directory on target servers
+      file:
+        path: /var/tmp/backups
+        state: directory
+
+    - name: Copy backup script to target servers
+      copy:
+        src: backup_script.sh
+        dest: /usr/local/bin/backup_script.sh
+        mode: '0755'
+
+    - name: Execute backup script on target servers
+      shell: /usr/local/bin/backup_script.sh
+      args:
+        chdir: /var/tmp
+      become: yes
+
+    - name: Create backup directory on control server
+      delegate_to: localhost
+      file:
+        path: "/var/tmp/backups/{{ inventory_hostname }}"
+        state: directory
+
+    - name: Pull backups from target servers to control server
+      synchronize:
+        src: /var/tmp/backups/
+        dest: "/var/tmp/backups/{{ inventory_hostname }}"
+        mode: pull
+      delegate_to: localhost
+
+    - name: Check file system utilization
+      command: df -h /
+      register: disk_space
+
+    - name: Fail if disk space utilization is over 85%
+      fail:
+        msg: "Disk space utilization is over 85%. Aborting upgrade."
+      when: (disk_space.stdout | regex_search('(\d+)% /') | int) > 85
+
+    - name: Check UFW status
+      command: ufw status
+      register: ufw_status
+
+    - name: Stop UFW if it is active
+      command: ufw disable
+      when: "'Status: active' in ufw_status.stdout"
+
+    - name: Check UFW status again
+      command: ufw status
+      register: ufw_status_after
+
+    - name: Fail if UFW is still active
+      fail:
+        msg: "UFW is still active. Please disable it manually and retry."
+      when: "'Status: active' in ufw_status_after.stdout"
+
+    - name: Take snapshot of the virtual machine before OS upgrade
+      shell: VBoxManage snapshot "{{ vm_name }}" take "pre-upgrade-snapshot" --live
+      delegate_to: localhost
+      register: snapshot_result
+
+    - name: Fail if snapshot was not successful
+      fail:
+        msg: "Failed to take snapshot of the VM before OS upgrade."
+      when: snapshot_result.rc != 0
+
+    - name: Get current OS version before upgrade
+      command: lsb_release -r
+      register: os_version_before
+
+    - name: Update all packages to the latest version
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install the update-manager-core package
+      apt:
+        name: update-manager-core
+        state: present
+
+    - name: Ensure all updates are applied
+      command: apt-get dist-upgrade -y
+      register: dist_upgrade_result
+
+    - name: Reboot the server after applying updates
+      reboot:
+        msg: "Reboot initiated by Ansible after applying updates"
+        pre_reboot_delay: 30
+        post_reboot_delay: 60
+      when: dist_upgrade_result.changed
+
+    - name: Upgrade the distribution to Ubuntu
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      when: dist_upgrade_result.changed
+
+    - name: Reboot the server after distribution upgrade
+      reboot:
+        msg: "Reboot initiated by Ansible for OS upgrade"
+        pre_reboot_delay: 30
+        post_reboot_delay: 60
+      when: dist_upgrade_result.changed
+
+    - name: Get OS version after upgrade
+      command: lsb_release -r
+      register: os_version_after
+
+    - name: Fail if OS version has not changed
+      fail:
+        msg: "Upgrade failed. The OS version remains the same."
+      when: os_version_before.stdout == os_version_after.stdout
+
+    - name: Inform if OS version has changed, indicating a successful upgrade
+      debug:
+        msg: "Upgrade successful. OS version changed from {{ os_version_before.stdout }} to {{ os_version_after.stdout }}."
+      when: os_version_before.stdout != os_version_after.stdout
+
